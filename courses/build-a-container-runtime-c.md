@@ -1805,7 +1805,14 @@ pointer *into the document at the memory section*; scanning for
 `"limit"` from there finds memory's own. Scan for `"pids"` first and
 you find its `"limit"` instead. The same trick reads the namespace
 array: find `"namespaces"`, find the `[`, and collect each `"type"`
-that appears before the closing `]`. (This position game is exactly the
+that appears before the closing `]`. One caution: that closing `]` is
+doing real work, and the resource sections need the same courtesy.
+Scan from `"memory"` with nothing to stop you, and an empty
+`"memory": {}` sends you sailing into the pids section to borrow *its*
+limit. The objects in this subset are flat, so the first `}` after the
+section opens is its end — a `"limit"` found beyond it belongs to the
+next section, and a section without its own simply defaults to
+unlimited. (This position game is exactly the
 order-independence a real parser gives you for free — build it once by
 hand and you'll never wonder what `encoding/json` is doing for you
 again.)
@@ -2162,6 +2169,20 @@ int main(void) {
 	check(plan_container("/b", quota_only, &p) == 0 &&
 	      strcmp(p.cpu_max, "25000 100000") == 0,
 	      "test_quota_without_period");
+
+	/* A section with no limit of its own defaults to unlimited — it
+	   must not borrow the next section's. Bound each scan at the
+	   section's closing '}'. */
+	const char *empty_memory =
+		"{ \"ociVersion\": \"1.2.0\", \"root\": { \"path\": \"r\" },"
+		"  \"linux\": { \"resources\": {"
+		" \"memory\": {},"
+		" \"pids\": { \"limit\": 64 } } } }";
+	memset(&p, 0, sizeof p);
+	check(plan_container("/b", empty_memory, &p) == 0 &&
+	      strcmp(p.memory_max, "max") == 0 &&
+	      strcmp(p.pids_max, "64") == 0,
+	      "test_empty_memory_does_not_borrow_pids_limit");
 
 	return failed;
 }
