@@ -8,9 +8,10 @@ description: >
   in C: parse config.json with your own scanner, turn namespace lists into
   clone flags, jail paths so a hostile config can't escape the rootfs, map
   container root to an unprivileged user, translate resource limits into
-  cgroup v2 writes, and drive the create/start/kill/delete lifecycle — the
+  cgroup v2 writes, plan the PTY-and-console-socket handoff behind
+  docker run -it, and drive the create/start/kill/delete lifecycle — the
   same decisions runc makes before every container on earth starts.
-duration_hours: 6
+duration_hours: 7
 tags: [systems, linux, containers, c]
 extended_reading:
   - title: OCI Runtime Specification — config.json
@@ -21,6 +22,8 @@ extended_reading:
     url: https://man7.org/linux/man-pages/man2/pivot_root.2.html
   - title: Control Group v2 — the kernel documentation
     url: https://docs.kernel.org/admin-guide/cgroup-v2.html
+  - title: "runc docs — terminals, stdio, and the console socket"
+    url: https://github.com/opencontainers/runc/blob/main/docs/terminals.md
   - title: "Liz Rice — Containers From Scratch (talk)"
     url: https://www.youtube.com/watch?v=8fi7uSYlOdc
 ---
@@ -1273,7 +1276,8 @@ Why is create/start split at all? Because a huge amount of setup must
 happen *inside* the container-to-be — namespaces entered, filesystem
 pivoted, cgroup joined — before the user's process is exec'd, and the
 caller often needs to act in that gap: attach the console, wire up
-networking (that's when CNI plugins run), run hooks. So `create` does
+networking (that's when CNI — Container Network Interface — plugins
+run), run hooks. So `create` does
 all the setup and then the init process **parks**, blocked on a pipe,
 with the user's command not yet started. `start` writes one byte into
 that pipe; init wakes and calls `execve`. Docker's `docker create` /
@@ -1411,6 +1415,309 @@ int main(void) {
 }
 ```
 
+# Lesson: A Terminal in the Box — PTYs and the Console Socket {#console}
+
+The `-it` in `docker run -it alpine sh` looks like an afterthought —
+two letters — but it flips the container into a different mode of
+existence. Programs *check* what their stdio is: `isatty(0)` asks the
+kernel "is this a terminal?" A shell that hears yes prints a prompt
+and enables line editing and job control; `sudo` will dare to ask for
+a password; `ls` picks colors. Wire the same programs to a pipe and
+they all go quiet and batch-shaped. So an interactive container needs
+its process to hold a *real terminal* — and since no physical teletype
+has been wired to a Unix machine in decades, the kernel provides fake
+ones.
+
+## The pseudoterminal pair
+
+A **PTY** is two connected devices pretending to be one serial line.
+Open `/dev/ptmx` (the portable wrapper is `posix_openpt`) and you get
+back the **master** fd, and the kernel conjures a matching **slave**
+device, `/dev/pts/N` — `ptsname` tells you which N, and
+`grantpt`/`unlockpt` make it openable. Bytes written on one end come
+out readable on the other, but not directly: in between sits the
+**line discipline**, the same kernel layer a hardware terminal gets.
+It echoes keystrokes back, holds input until Enter, and — the crucial
+one — turns a `0x03` byte (Ctrl-C) into a `SIGINT` delivered to the
+slave's foreground process group. Window size lives here too
+(`TIOCSWINSZ`), which is what the spec's optional `consoleSize` field
+feeds — and "Runtimes MUST ignore `consoleSize` if `terminal` is
+`false` or unset."
+
+In config.json all of this is one field: `process.terminal` (bool,
+OPTIONAL, defaults to false). The spec's gloss is exactly the plan:
+"a pseudoterminal pair is allocated for the process and the
+pseudoterminal pty is duplicated on the process's standard streams."
+
+## Plugging the slave in
+
+Where should the runtime open `/dev/ptmx`? *Inside the container* —
+after the mount namespace exists and the container's own `devpts`
+instance is mounted at `/dev/pts` — so the slave node lives in the
+container's tree and its ownership follows the id mappings from the
+user-namespaces lesson. Then init, parked before its `execve`, wires
+itself up:
+
+1. `setsid()` — become a session leader; a process that isn't one
+   cannot acquire a controlling terminal.
+2. `ioctl(slave, TIOCSCTTY, 0)` — adopt the slave as the
+   **controlling terminal**, the thing that decides which process
+   group that Ctrl-C `SIGINT` lands on.
+3. `dup2` the slave onto fds 0, 1, and 2, and close the original.
+
+From that point on the user's command isn't being fooled about having
+a terminal. It has one.
+
+## Who keeps the master? The console socket
+
+Here is the wrinkle the lifecycle lesson set up: `create` finishes
+its work and *exits* — init parks alone, and there is no long-running
+runtime process. But `create` is also the code that just allocated
+the PTY, so the master fd is about to die with it, taking the
+terminal's far end into the void.
+
+runc's answer — and yours — is the **console socket**. The caller
+(containerd, or you at a shell) listens on an `AF_UNIX` socket and
+hands its path to `create` as `--console-socket`. After allocating
+the PTY, the runtime connects to that socket and sends *the master
+fd itself* through it: `sendmsg` with an `SCM_RIGHTS` control
+message. SCM_RIGHTS is the kernel's fd-passing mechanism — the
+receiver calls `recvmsg` and finds a brand-new entry in its own fd
+table referring to the *same open file*, the PTY master. Not the fd
+number; the open file. The runtime can now exit in peace. Whoever
+holds that socket holds the container's keyboard and screen — that
+is the far end of `docker attach`.
+
+The full handoff inside `create` — the slave stays in the box as
+stdio; the master leaves through the console socket:
+
+```d2
+direction: right
+rt: "your runtime\ncreate()" {
+  style.stroke: "#d97706"
+  style.stroke-width: 3
+}
+pty: "PTY pair" {
+  shape: sql_table
+  master: "master fd"
+  slave: "/dev/pts/0"
+}
+init: "container init\nstdio = slave\nTIOCSCTTY"
+caller: "caller holds\nconsole.sock"
+rt -> pty: "posix_openpt"
+pty.slave -> init: "dup2 → 0,1,2"
+pty.master -> caller: "SCM_RIGHTS"
+```
+
+## Pass-through, and two rules worth refusing
+
+With `terminal: false` there is no PTY at all: stdio is plain
+**pipes** to wherever the caller pointed them. Logs flow out, EOF
+flows in, nothing echoes, Ctrl-C is nobody's business. For batch
+workloads that's exactly right.
+
+What's never right is a config and a command line that disagree, and
+runc refuses both directions (its `checkTerminal`, translated to your
+create/start model, which always detaches):
+
+- `terminal: true` but no console socket — error: "cannot allocate
+  tty if runc will detach without setting console socket." The
+  master would be orphaned the moment create returns.
+- A console socket but `terminal` false or absent — error: "cannot
+  use console socket if runc will not detach or allocate tty." A
+  socket nobody will ever send an fd down means the caller is
+  confused, and refusing beats surprising them.
+
+One more sharp edge, an old friend from the secure-join lesson:
+validate paths *at plan time*. `AF_UNIX` socket paths have a hard
+kernel limit — `sun_path` is 108 bytes on Linux, NUL included — so a
+console-socket path longer than 107 characters can never connect and
+deserves rejection before a single syscall happens.
+
+## Challenge: Plan the Console {#console-plan points=15}
+
+Two functions, both pure decision logic. `json_bool` teaches your
+scanner the one JSON type it can't read yet — and unlike its cousins
+it must report *three* outcomes, because absent (defaults to false)
+and present-as-false take different paths through the rules.
+`console_plan` then makes the call that `create` would act on: which
+mode, which socket path, or a refusal. The tests link `json_bool`
+directly, so leave it non-static.
+
+### Starter
+
+```c
+#include <stddef.h>
+#include <string.h>
+
+#define CONSOLE_PIPES 0 /* pass-through: stdio is plain pipes      */
+#define CONSOLE_PTY   1 /* new terminal: PTY master → console.sock */
+
+/* sizeof(struct sockaddr_un.sun_path) on Linux, NUL included. */
+#define SUN_PATH_MAX 108
+
+struct console_plan {
+	int mode;                       /* CONSOLE_PIPES or CONSOLE_PTY  */
+	char socket_path[SUN_PATH_MAX]; /* "" when mode is CONSOLE_PIPES */
+};
+
+/* ---- given: the scanner core from earlier lessons ---- */
+
+static int is_ws(char c) {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static const char *after_key(const char *doc, const char *key) {
+	size_t klen = strlen(key);
+	for (const char *p = doc; (p = strchr(p, '"')) != NULL; p++) {
+		if (strncmp(p + 1, key, klen) != 0 || p[1 + klen] != '"')
+			continue;
+		const char *q = p + klen + 2;
+		while (is_ws(*q))
+			q++;
+		if (*q != ':')
+			continue;
+		return q + 1;
+	}
+	return NULL;
+}
+
+/* ---- implement these ---- */
+
+/* Three-way: 1 if `key` is present with a literal true/false value
+   (*out = 1 or 0), 0 if the key is absent, -1 if the value is
+   anything else. Absent and false are different answers — the
+   caller needs to know which rule it is applying. */
+int json_bool(const char *doc, const char *key, int *out) {
+	/* TODO: after_key, skip whitespace, match "true" or "false" */
+	(void)after_key;
+	(void)doc;
+	(void)key;
+	(void)out;
+	return -1;
+}
+
+/* Decide the stdio wiring for a create that will detach.
+   doc is the config's process object; socket_path is the caller's
+   --console-socket argument, or NULL if it wasn't given.
+   terminal true → CONSOLE_PTY, socket required, path copied.
+   terminal false or absent → CONSOLE_PIPES, socket must be NULL.
+   Malformed terminal, missing/empty/oversized socket path: -1. */
+int console_plan(const char *doc, const char *socket_path,
+                 struct console_plan *p) {
+	/* TODO: json_bool, then the two runc rules */
+	(void)json_bool;
+	(void)doc;
+	(void)socket_path;
+	(void)p;
+	return -1;
+}
+```
+
+### Tests
+
+```c
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#define CONSOLE_PIPES 0
+#define CONSOLE_PTY   1
+#define SUN_PATH_MAX  108
+
+struct console_plan {
+	int mode;
+	char socket_path[SUN_PATH_MAX];
+};
+
+int json_bool(const char *doc, const char *key, int *out);
+int console_plan(const char *doc, const char *socket_path,
+                 struct console_plan *p);
+
+static int failed;
+
+static void check(int ok, const char *name) {
+	if (ok) {
+		printf("--- PASS: %s\n", name);
+	} else {
+		printf("--- FAIL: %s\n", name);
+		failed++;
+	}
+}
+
+int main(void) {
+	struct console_plan p;
+	int b;
+
+	/* json_bool: three outcomes, not two. */
+	b = -7;
+	check(json_bool("{ \"terminal\": true }", "terminal", &b) == 1 &&
+	      b == 1, "test_bool_true");
+	b = -7;
+	check(json_bool("{ \"terminal\": false }", "terminal", &b) == 1 &&
+	      b == 0, "test_bool_false");
+	check(json_bool("{ \"tty\": true }", "terminal", &b) == 0,
+	      "test_bool_absent_key");
+	check(json_bool("{ \"terminal\": null }", "terminal", &b) == -1,
+	      "test_bool_null_is_malformed");
+	check(json_bool("{ \"terminal\": \"true\" }", "terminal", &b) == -1,
+	      "test_bool_string_is_malformed");
+	b = -7;
+	check(json_bool("{ \"terminal\" \t:\n\ttrue }", "terminal", &b) == 1 &&
+	      b == 1, "test_bool_whitespace");
+
+	/* The two happy paths. */
+	memset(&p, 0x55, sizeof p);
+	check(console_plan("{ \"terminal\": true }",
+	                   "/run/ctr/console.sock", &p) == 0 &&
+	      p.mode == CONSOLE_PTY &&
+	      strcmp(p.socket_path, "/run/ctr/console.sock") == 0,
+	      "test_terminal_and_socket_is_pty");
+	memset(&p, 0x55, sizeof p);
+	check(console_plan("{ \"args\": [ \"sh\" ] }", NULL, &p) == 0 &&
+	      p.mode == CONSOLE_PIPES && p.socket_path[0] == '\0',
+	      "test_absent_terminal_is_pipes");
+	check(console_plan("{ \"terminal\": false }", NULL, &p) == 0 &&
+	      p.mode == CONSOLE_PIPES,
+	      "test_terminal_false_is_pipes");
+	check(console_plan("{ \"args\": [ \"sh\", \"-c\" ], \"terminal\": true }",
+	                   "/s", &p) == 0 && p.mode == CONSOLE_PTY,
+	      "test_terminal_after_other_keys");
+
+	/* runc's two refusals. */
+	check(console_plan("{ \"terminal\": true }", NULL, &p) == -1,
+	      "test_tty_without_socket_rejected");
+	check(console_plan("{ \"terminal\": false }", "/tmp/c.sock", &p) == -1,
+	      "test_socket_without_tty_rejected");
+	check(console_plan("{}", "/tmp/c.sock", &p) == -1,
+	      "test_socket_with_absent_terminal_rejected");
+
+	/* A malformed config refuses, whatever the command line says. */
+	check(console_plan("{ \"terminal\": \"true\" }", "/tmp/c.sock", &p) == -1,
+	      "test_string_terminal_rejected");
+	check(console_plan("{ \"terminal\": 1 }", "/tmp/c.sock", &p) == -1,
+	      "test_numeric_terminal_rejected");
+
+	/* sun_path is 108 bytes with the NUL: 107 chars fit, 108 don't. */
+	char longp[120];
+	memset(longp, 'a', sizeof longp);
+	longp[0] = '/';
+	longp[107] = '\0';
+	memset(&p, 0x55, sizeof p);
+	check(console_plan("{ \"terminal\": true }", longp, &p) == 0 &&
+	      strcmp(p.socket_path, longp) == 0,
+	      "test_107_char_path_fits");
+	longp[107] = 'a';
+	longp[108] = '\0';
+	check(console_plan("{ \"terminal\": true }", longp, &p) == -1,
+	      "test_108_char_path_rejected");
+	check(console_plan("{ \"terminal\": true }", "", &p) == -1,
+	      "test_empty_socket_path_rejected");
+
+	return failed;
+}
+```
+
 # Final Challenge: plan_container {#final points=50}
 
 Every piece you've built is one column of the same translation: the
@@ -1440,6 +1747,9 @@ Planning before executing isn't just tidiness. A runtime that validates
 *everything* first can reject a bad config having touched nothing — no
 half-made namespaces to unwind, no orphaned cgroup nodes. runc calls
 this phase "loading the spec," and it's where most config attacks die.
+(Your console plan stays a separate call beside this one — its input
+includes the `--console-socket` flag, which lives on the command
+line, not in the document `plan_container` translates.)
 
 `plan_container(bundle, doc, p)` handles this config subset:
 
@@ -1688,6 +1998,7 @@ static const char *after_key(const char *doc, const char *key) {
    start with an optional '-' and at least one digit. */
 static int json_int(const char *doc, const char *key, long long *out) {
 	/* TODO: after_key, skip whitespace, optional '-', digits */
+	(void)after_key;
 	(void)doc;
 	(void)key;
 	(void)out;
@@ -1710,6 +2021,8 @@ static int ns_clone_flags(const char *doc, unsigned long *out) {
    violation described in the challenge text. */
 int plan_container(const char *bundle, const char *doc, struct plan *p) {
 	/* TODO: version gate, rootfs, hostname, namespaces, resources */
+	(void)json_int;
+	(void)ns_clone_flags;
 	(void)bundle;
 	(void)doc;
 	(void)p;
