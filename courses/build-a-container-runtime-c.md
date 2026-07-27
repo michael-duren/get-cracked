@@ -4,14 +4,16 @@ title: Build an OCI Container Runtime in C
 language: c
 description: >
   Containers are not virtual machines — they're ordinary Linux processes
-  wearing a disguise the kernel provides. Build the brain of an OCI runtime
-  in C: parse config.json with your own scanner, turn namespace lists into
-  clone flags, jail paths so a hostile config can't escape the rootfs, map
-  container root to an unprivileged user, translate resource limits into
-  cgroup v2 writes, plan the PTY-and-console-socket handoff behind
-  docker run -it, and drive the create/start/kill/delete lifecycle — the
-  same decisions runc makes before every container on earth starts.
-duration_hours: 7
+  wearing a disguise the kernel provides. Build minict, a real OCI runtime
+  in C, one piece per lesson: parse config.json with your own scanner, turn
+  namespace lists into clone flags, jail paths so a hostile config can't
+  escape the rootfs, map container root to an unprivileged user, translate
+  resource limits into cgroup v2 writes, hand a PTY master down a console
+  socket, and drive the create/start/kill/delete lifecycle. Every lesson
+  ends with a command you run on your own machine, and the last one drops
+  you into a shell inside a container your own runtime built — rootless,
+  no Docker, no root.
+duration_hours: 12
 tags: [systems, linux, containers, c]
 extended_reading:
   - title: OCI Runtime Specification — config.json
@@ -24,6 +26,10 @@ extended_reading:
     url: https://docs.kernel.org/admin-guide/cgroup-v2.html
   - title: "runc docs — terminals, stdio, and the console socket"
     url: https://github.com/opencontainers/runc/blob/main/docs/terminals.md
+  - title: "user_namespaces(7) — mapping files, and the rules around them"
+    url: https://man7.org/linux/man-pages/man7/user_namespaces.7.html
+  - title: "Rootless containers — the delegation rules cgroups follow"
+    url: https://rootlesscontaine.rs/getting-started/common/cgroup2/
   - title: "Liz Rice — Containers From Scratch (talk)"
     url: https://www.youtube.com/watch?v=8fi7uSYlOdc
 ---
@@ -95,17 +101,91 @@ runs as, what memory it may use. Images, registries, layers, tags — none
 of that exists at this layer; the high-level runtime already flattened all
 of it into `rootfs/`.
 
-## What you'll build, and how the grading works
+## The project: minict
 
-A real runtime needs root (or user namespaces) to do its work, and the
-grader that checks your code runs in a sandbox that has neither. So this
-course splits honestly: **lessons** walk through the privileged syscall
-choreography you'd run on your own machine; **challenges** grade the
-decision logic around those syscalls — the parsing, validation, mapping,
-and formatting that *is* most of a real runtime's code. Every piece you
-write here has a direct counterpart inside runc.
+You are building one program across this whole course. It is called
+**minict**, it is about 700 lines of C, and when you are done this
+works on your own laptop, with no Docker daemon and no `sudo`:
 
-First piece: the OCI config lists namespaces by name — `"pid"`,
+```
+$ minict create demo ./bundle --console-socket /tmp/console.sock
+minict: created demo — host pid 40219, pid 1 inside
+$ minict start demo
+/ # hostname
+duck
+/ # ps
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    4 root      0:00 ps
+/ # exit
+$ minict delete demo
+```
+
+That shell is pid 1 of its own pid namespace, its `/` is an unpacked
+image, it believes it is root, and it cannot spawn more than the
+processes its cgroup allows. It is a container, and nothing built it
+but your code.
+
+Each lesson adds one piece, and each source file is mostly the
+functions those lessons' challenges grade:
+
+```
+minict/
+  Makefile
+  bundle/            the container you'll run: config.json + rootfs/
+  src/
+    minict.h         shared declarations
+    oci.c            L2 the JSON scanner · L1 nsflags · L4 secure_join
+    nspid.c          L3 the pid-ladder parser
+    idmap.c          L5 id translation, both directions
+    cgroup.c         L6 the three formatters, and the writes they feed
+    state.c          L7 the lifecycle FSM, and state.json
+    console.c        L8 the console plan, the PTY, the fd handoff
+    container.c      the syscall choreography — given to you in full
+    main.c           CLI dispatch — given to you in full
+    attach.c         the caller's side of the console socket — given
+```
+
+Two files (`container.c`, `main.c`) are the privileged choreography;
+they are printed in full in the epilogue and you paste them in. Every
+other file is yours. That division is not arbitrary — it is roughly how
+runc itself divides, and it is why the challenges here grade *decision
+logic* rather than syscalls: parsing, validation, mapping, and
+formatting are the overwhelming majority of a real runtime's code, and
+the only part that can be tested without a kernel to talk to. The
+grader runs in a sandbox with no privileges to hand you, so the
+challenges below are graded; **the milestones you run are not
+submitted** — they're yours, and they're the point.
+
+## What you need
+
+A Linux machine (or VM — WSL2 works; macOS does not, since the syscalls
+*are* the subject). Then:
+
+- **gcc or clang**, and `make`.
+- **Unprivileged user namespaces enabled.** Check with
+  `unshare -U -r id` — it should print `uid=0(root)`. If it errors,
+  see the epilogue's troubleshooting note.
+- **A rootfs to run.** Any unpacked image works. The one-liner used
+  throughout this course, if you have Docker available:
+
+  ```sh
+  mkdir -p bundle/rootfs
+  cid=$(docker create busybox)
+  docker export "$cid" | tar -x -C bundle/rootfs
+  docker rm "$cid"
+  ```
+
+  No Docker? Download a busybox static binary into `bundle/rootfs/bin/`
+  and symlink `sh` to it — a rootfs is just a directory tree, and the
+  runtime never asks where it came from.
+
+Everything after this runs as your normal user. If a command in this
+course needs `sudo`, it is a bug in the course.
+
+## First piece: names to flags
+
+The OCI config lists namespaces by name — `"pid"`,
 `"mount"`, `"network"`. The kernel doesn't take names; it takes a bitmask
 of `CLONE_*` flags passed to the `clone` or `unshare` syscall. Each flag
 is one bit (`CLONE_NEWPID` is `0x20000000`, `CLONE_NEWNS` is
@@ -119,6 +199,28 @@ newer `time` namespace this course's seven-flag subset leaves out —
 because refusing beats silently running less isolated than asked; and
 the same type listed twice (the spec forbids it, and a duplicate usually
 means a generator bug).
+
+## Milestone 0: the bitmask is the whole interface
+
+Before writing `nsflags`, prove to yourself that a bitmask is really all
+the kernel wants. `unshare(1)` is a thin wrapper over the syscall your
+runtime will call:
+
+```sh
+$ unshare -U -r --uts sh -c 'hostname duck; hostname; id -u'
+duck
+0
+$ hostname
+your-laptop
+```
+
+You just changed the hostname — as "root" — and your real machine did
+not notice. Two flags (`CLONE_NEWUSER | CLONE_NEWUTS`) bought that.
+`nsflags`, your first challenge, is the function that turns
+`["uts","user"]` from a config file into those two bits. Solve it, and
+save it as `src/oci.c` in your project directory; the next lesson adds
+the scanner that reads the names out of `config.json` in the first
+place.
 
 ## Challenge: Names to Clone Flags {#ns-clone-flags points=10}
 
@@ -315,6 +417,73 @@ final challenge scans *from the section's position*, which you'll meet in
 the last lesson. A production runtime uses a real parser; know which tool
 you're holding.
 
+## Milestone 1: your bundle's config
+
+Write the `config.json` your runtime will spend the rest of the course
+reading. Save it as `bundle/config.json`, next to the `rootfs/` you
+unpacked in lesson one:
+
+```json
+{
+  "ociVersion": "1.2.0",
+  "hostname": "duck",
+  "root": { "path": "rootfs" },
+  "process": {
+    "terminal": false,
+    "args": ["/bin/sh"],
+    "cwd": "/"
+  },
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "mount" },
+      { "type": "uts" },
+      { "type": "user" }
+    ],
+    "resources": {
+      "memory": { "limit": 268435456 },
+      "cpu": { "quota": 50000, "period": 100000 },
+      "pids": { "limit": 64 }
+    }
+  }
+}
+```
+
+Four namespaces, not seven: `network` and `ipc` are left out so the
+container shares your network (nothing to configure, and DNS works),
+and `cgroup` is left out because rootless cgroup setup gets its own
+lesson. Add them later and watch what breaks — that's a good hour.
+
+Then prove your scanner reads it. Once you've solved the challenge
+below, save it as `src/oci.c` alongside `nsflags` and point a throwaway
+`main` at the real file:
+
+```c
+/* scratch.c — cc -o t src/oci.c scratch.c && ./t bundle/config.json */
+#include <stdio.h>
+int json_str(const char *doc, const char *key, char *out, size_t cap);
+
+int main(int argc, char **argv) {
+	FILE *f = fopen(argv[1], "rb");
+	char doc[4096];
+	doc[fread(doc, 1, sizeof doc - 1, f)] = '\0';
+
+	char host[64], path[64];
+	json_str(doc, "hostname", host, sizeof host);
+	json_str(doc, "path", path, sizeof path);
+	printf("hostname=%s rootfs=%s\n", host, path);
+	return 0;
+}
+```
+
+```
+hostname=duck rootfs=rootfs
+```
+
+Two strings out of a real document, using no library. That is the whole
+input side of a container runtime — everything else this course does is
+a consequence of those bytes.
+
 ## Challenge: A Key Scanner {#json-string-scan points=15}
 
 Implement `json_str`. It must skip key-lookalike values, tolerate
@@ -507,6 +676,38 @@ That parsing is your challenge: `NSpid:` then one or more decimal pids,
 separated by tabs or spaces. As always at a trust boundary, garbage —
 a wrong field name, a non-numeric token, more levels than your buffer
 holds — is an error, not a shrug.
+
+## Milestone 2: two truths about one process
+
+See the double pid yourself, with no code at all. In one terminal, put a
+shell in a fresh pid namespace and have it report what it believes:
+
+```sh
+$ unshare -U -r --pid --fork --mount-proc sh -c 'echo "inside I am pid $$"; exec sleep 300'
+inside I am pid 1
+```
+
+(The `exec` matters: it replaces the shell with `sleep`, so the process
+still sitting there afterwards is the same one that just told you it is
+pid 1.) In another terminal, ask the host about that process:
+
+```
+$ pgrep -x sleep
+41120
+$ grep NSpid /proc/41120/status
+NSpid:	41120	1
+```
+
+One process, two numbers, both true. `41120` is the pid you can signal
+from out here; `1` is what it calls itself in there. `--mount-proc` is
+the flag that makes the inside view honest — drop it and `ps` inside
+still lists your whole host, which is the third sharp edge from the
+list above, live.
+
+Your challenge is the parser for that `NSpid:` line. Save it as
+`src/nspid.c`; `minict create` will use it at the end of this course to
+print `host pid 41120, pid 1 inside` — the single most useful line of
+output a runtime can give you when something is wrong.
 
 ## Challenge: Parse the Pid Ladder {#nspid-parse points=10}
 
@@ -774,6 +975,46 @@ inside the rootfs add another layer of attack that lexical resolution
 can't see — real runtimes pair this with `openat2`'s `RESOLVE_BENEATH`.
 Build the lexical core first; it's the part every defense shares.)
 
+## Milestone 3: stand inside the image
+
+You can perform the whole dance from a shell, and you should — it is
+six commands, and watching `/` change under you is worth more than
+reading about it. `unshare -Urm` gives you a user namespace (so you may
+mount) and a mount namespace (so your damage is private):
+
+```sh
+$ cd bundle
+$ unshare -U -r -m
+# mount --make-rprivate /              # step 1
+# mount --bind rootfs rootfs           # step 2
+# cd rootfs                            # step 3
+# mkdir -p oldroot
+# pivot_root . oldroot                 # steps 4–5, the explicit form
+# cd /
+# ls
+bin  dev  etc  home  lib  lib64  oldroot  proc  root  sys  tmp  usr  var
+# ls /oldroot/home                     # the host is STILL reachable
+your-username
+# umount -l /oldroot && rmdir /oldroot
+# ls /oldroot
+ls: /oldroot: No such file or directory
+# cat /etc/hostname
+```
+
+Read those last four commands again, because they are the entire point
+of this lesson. Between `pivot_root` and `umount -l`, the host's
+filesystem is sitting at `/oldroot`, fully readable — that is the red
+edge in the diagram, and a container that got that far and stopped
+would be no container at all. The unmount is what closes it.
+
+(This shell version uses an explicit `oldroot` directory, which is the
+easy form to *watch*. The `pivot_root(".", ".")` idiom your runtime
+uses does the same thing without needing that directory to exist in the
+image — worth having seen both.)
+
+Then `exit`: the mount namespace evaporates, and your real `/` was
+never touched. Nothing you just did needed root.
+
 ## Challenge: Jail a Path {#secure-join points=15}
 
 Implement `secure_join(root, path, out, cap)`: join `path` onto `root`
@@ -954,6 +1195,48 @@ container id out, `idmap_to_container` brings a host id in, and either
 returns -1 for an id no range covers. runc's version of this function
 answers "root inside is who outside?" every time you `docker exec`.
 
+## Milestone 4: be root, own nothing
+
+Watch a single process hold both identities at once. Start a namespace
+and leave it running:
+
+```sh
+$ unshare -U -r --uts sh -c 'id -u; touch /tmp/made-by-fake-root; exec sleep 300'
+0
+```
+
+It says uid 0. Now, from another terminal, ask the host who that
+process really is and who owns the file it just created:
+
+```
+$ pgrep -x sleep
+42317
+$ grep -E '^Uid|^NSpid' /proc/42317/status
+Uid:	1000	1000	1000	1000
+NSpid:	42317
+$ cat /proc/42317/uid_map
+         0       1000          1
+$ ls -l /tmp/made-by-fake-root
+-rw-r--r-- 1 your-username your-username 0 Jul 26 11:04 /tmp/made-by-fake-root
+```
+
+Four views of one fact. Inside: uid 0. To the kernel's accounting: uid
+1000, your ordinary account. The `uid_map` line is the translation
+table this lesson is about, in the exact `inside outside count` order —
+and `0 1000 1` is precisely the mapping your runtime will write, one
+id wide, because an unprivileged parent may only map itself.
+
+The file is the punchline. "Root" created it, and it belongs to *you* —
+not to root, and not to nobody. A container that escapes this
+filesystem is holding an account that can't read your neighbors' files,
+can't bind port 80, and can't load a kernel module. That is why
+rootless containers are the default in podman and why this course never
+asks you for `sudo`.
+
+Your challenge is the lookup that this table implies. Save it as
+`src/idmap.c`; `minict` calls it to build the very `0 1000 1` line you
+just read.
+
 ## Challenge: Translate Both Ways {#idmap points=10}
 
 Implement both directions of range lookup. An id belongs to a range when
@@ -1130,6 +1413,71 @@ increasingly set both — Kubernetes' memory QoS feature does. Formats
 grow; functions that produce them should be small and testable — which
 is exactly what you're about to write.)
 
+## Rootless cgroups: the one thing you must be given
+
+Namespaces you can create as an ordinary user. Cgroups you cannot —
+`/sys/fs/cgroup` is root-owned, and `mkdir` there fails for you. What
+makes rootless limits possible is **delegation**: systemd can hand your
+user a subtree that you own outright. `systemd-run --user --scope -p
+Delegate=yes` starts a scope whose directory is yours to `mkdir` in.
+
+One structural rule bites immediately, and it is the
+no-internal-process rule from above. Your shell is *in* the delegated
+scope; the moment you create a child cgroup, the scope has children and
+may no longer hold processes directly. So the first move is always:
+make a leaf for yourself, step into it, and only then enable
+controllers for your children.
+
+## Milestone 5: a limit you can feel
+
+```sh
+$ systemd-run --user --scope -p Delegate=yes bash
+```
+
+Inside that shell:
+
+```sh
+$ CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+$ mkdir "$CG/sup" && echo $$ > "$CG/sup/cgroup.procs"   # step aside
+$ echo "+pids +memory +cpu" > "$CG/cgroup.subtree_control"
+$ mkdir "$CG/ctr" && echo 8 > "$CG/ctr/pids.max"
+$ cat "$CG/ctr/pids.max"
+8
+```
+
+Now put a shell in that leaf and ask it for more processes than it is
+allowed:
+
+```sh
+$ sh -c 'echo $$ > "'$CG'/ctr/cgroup.procs"
+  for i in $(seq 20); do sleep 5 & done; wait'
+sh: fork: retry: Resource temporarily unavailable
+sh: fork: retry: Resource temporarily unavailable
+sh: fork: retry: Resource temporarily unavailable
+```
+
+The kernel refused. Not the shell, not a policy daemon — `fork`
+returned `EAGAIN` because the cgroup was full, and it will do that to a
+fork bomb just as flatly. Check the receipt:
+
+```sh
+$ cat "$CG/ctr/pids.events"
+max 4
+```
+
+Four forks denied that time. Your number will differ — the shell keeps
+retrying and the `sleep`s keep exiting, so how many requests collide
+with the ceiling is a race — but it is always non-zero, and the ceiling
+itself never moves. `memory.max` and `cpu.max` work the same way, with
+`memory.events` and `cpu.stat` as their receipts. Type `exit` to leave
+the scope and systemd removes the whole subtree.
+
+Your challenge is the three formatters that produce the strings you
+just echoed by hand. Save them as `src/cgroup.c`. If delegation isn't
+available on your machine, `minict` will print a note and run without
+limits — every other milestone still works, and the epilogue explains
+the fallback.
+
 ## Challenge: Speak cgroup {#cgroup-files points=10}
 
 Implement the three formatters. `snprintf` into the caller's buffer;
@@ -1304,6 +1652,72 @@ runc tracks the current state in a `state.json` per container; the
 `pid`, bundle path) so orchestrators can reconcile. Your challenge is
 the machine itself: one function, the full table, every invalid edge
 refused.
+
+## How init parks: the exec fifo
+
+One implementation detail deserves spelling out, because "blocked on a
+pipe" glosses over a real problem. `create` exits. If the pipe's write
+end lived in `create`, it would close on exit and init's `read` would
+return 0 immediately — the container would start itself.
+
+runc's answer is a **FIFO** (a named pipe) in the state directory,
+and the trick is which end each side opens:
+
+- `create` makes the fifo, opens it `O_RDWR`, and lets the cloned child
+  inherit that fd. `O_RDWR` is the load-bearing flag: opening a fifo
+  read-only blocks until a writer shows up, and write-only fails with
+  `ENXIO` when no reader exists — `O_RDWR` does neither. Init then
+  blocks in `read()`, which is the parked state.
+- `start` opens the same fifo `O_WRONLY` and writes one byte. Init
+  wakes and calls `execve`.
+
+Because the child holds an inherited copy of the open file description,
+the fifo keeps a reader even after `create` is long gone. The container
+can sit parked for hours; `state` will keep saying `created`.
+
+## Milestone 6: the seam, visible
+
+Once the epilogue's `container.c` and `main.c` are in place — or if you
+are reading ahead, after you finish the course — this is the sequence
+that proves the state machine is real:
+
+```
+$ minict create demo ./bundle
+minict: created demo — host pid 40219, pid 1 inside
+$ minict state demo
+{
+  "ociVersion": "1.2.0",
+  "status": "created",
+  "pid": 40219,
+  "bundle": "/home/you/minict/bundle"
+}
+```
+
+The container exists. Its namespaces are made, its rootfs is pivoted,
+its cgroup is set — and `/bin/sh` has not run. Prove it: `ps -p 40219`
+shows the process alive, and nothing has been executed. Then try to
+skip a step:
+
+```
+$ minict delete demo
+minict: cannot delete a created container
+```
+
+That refusal is `lifecycle_next(ST_CREATED, EV_DELETE)` returning -1 —
+your table, enforcing the spec. Now use the seam properly:
+
+```
+$ minict start demo
+/ # exit
+$ minict state demo | grep status
+  "status": "stopped",
+$ minict delete demo
+minict: deleted demo
+```
+
+Save your state machine as `src/state.c`. It grows one companion in the
+project — the `state.json` reader and writer — and that pairing is the
+whole `state` operation.
 
 ## Challenge: The State Machine {#lifecycle-fsm points=10}
 
@@ -1533,6 +1947,77 @@ validate paths *at plan time*. `AF_UNIX` socket paths have a hard
 kernel limit — `sun_path` is 108 bytes on Linux, NUL included — so a
 console-socket path longer than 107 characters can never connect and
 deserves rejection before a single syscall happens.
+
+## An ordering problem worth seeing coming
+
+The plan says "allocate the PTY inside the container." The console
+socket, meanwhile, is a path on the *host* — `/tmp/console.sock`.
+After `pivot_root` the container cannot name that path at all. So the
+handoff has to straddle the pivot, and the order is forced:
+
+1. **Before the pivot**, `connect()` to the console socket. Keep the
+   fd. A connected socket is an open file description; it does not care
+   what `/` points at afterwards.
+2. **After the pivot**, mount the container's own `devpts` at
+   `/dev/pts`, then open the multiplexor and allocate the pair.
+3. Send the master down the fd from step 1, `close` it, and wire the
+   slave onto 0/1/2.
+
+Step 2 has a wrinkle that will cost you twenty minutes if nobody warns
+you: `posix_openpt` opens `/dev/ptmx`, but a freshly mounted devpts
+instance puts its multiplexor at `/dev/pts/ptmx`. Real container images
+ship a `/dev/ptmx → pts/ptmx` symlink for exactly this reason; your
+runtime creates it if the image didn't.
+
+## Milestone 7: attach to your own container
+
+The far end needs a program: something that listens on the socket,
+receives the fd, and relays your keyboard. That's `attach.c`, printed
+in full in the epilogue — about 120 lines, most of it `poll`. Run it
+first, in one terminal:
+
+```
+$ minict-attach /tmp/console.sock
+minict-attach: waiting on /tmp/console.sock
+```
+
+Then, in another, create a container whose config says
+`"terminal": true`:
+
+```
+$ minict create demo ./bundle --console-socket /tmp/console.sock
+minict: created demo — host pid 40219, pid 1 inside
+$ minict start demo
+```
+
+Back in the first terminal:
+
+```
+minict-attach: got the pty master (fd 5)
+/ # tty
+/dev/pts/0
+/ # echo isatty=$( [ -t 0 ] && echo YES || echo no )
+isatty=YES
+/ # exit
+minict-attach: console closed
+```
+
+A prompt, because the shell asked `isatty(0)` and heard yes. Line
+editing works. Ctrl-C interrupts instead of killing your terminal,
+because the `SIGINT` is generated by the container's line discipline
+and delivered to the container's foreground process group. `tty` names
+`/dev/pts/0` — device zero of an instance that exists only inside this
+container; your host's `/dev/pts/0` is somebody else's terminal
+entirely.
+
+Try the two refusals too, and watch your own validation fire:
+
+```
+$ minict create bad ./bundle           # config says terminal: true
+minict: terminal/console-socket mismatch
+```
+
+Save your work as `src/console.c`.
 
 ## Challenge: Plan the Console {#console-plan points=15}
 
@@ -2187,3 +2672,1143 @@ int main(void) {
 	return failed;
 }
 ```
+# Lesson: Epilogue: Run It for Real {#run-it-for-real}
+
+Every challenge in this course graded a decision, and every milestone
+let you watch the kernel obey one. This epilogue is where the two
+halves meet: the ~350 lines of syscall choreography that turn your
+nine solutions into a program you can run. Nothing below is graded and
+there is nothing to submit. What there is instead: a working OCI
+runtime, on your machine, built by you, that needs no daemon and no
+root.
+
+## What's already yours
+
+Six files hold all nine of your solutions — paste each one in under the
+header shown, and that file is done:
+
+```
+src/oci.c       json_str · nsflags · secure_join · plan_container
+                (plus json_int, section_int, ns_clone_flags, after_key
+                from the final challenge's starter)
+src/nspid.c     nspid_parse
+src/idmap.c     idmap_to_host · idmap_to_container
+src/cgroup.c    cg_cpu_max · cg_memory_max · cg_pids_max
+src/state.c     lifecycle_next
+src/console.c   json_bool · console_plan
+```
+
+Four of those need a companion the challenges couldn't ask for,
+because each one touches the filesystem. They are short, and they are
+listed below with the file they belong in.
+
+## The shared header
+
+`src/minict.h` — every declaration in one place, so the files above
+compile against the same types:
+
+```c
+#ifndef MINICT_H
+#define MINICT_H
+
+#include <stddef.h>
+
+#define CLONE_NEWNS_     0x00020000u
+#define CLONE_NEWCGROUP_ 0x02000000u
+#define CLONE_NEWUTS_    0x04000000u
+#define CLONE_NEWIPC_    0x08000000u
+#define CLONE_NEWUSER_   0x10000000u
+#define CLONE_NEWPID_    0x20000000u
+#define CLONE_NEWNET_    0x40000000u
+
+#define CONSOLE_PIPES 0
+#define CONSOLE_PTY   1
+#define SUN_PATH_MAX  108
+
+struct plan {
+	char rootfs[256];
+	char hostname[64];
+	unsigned long clone_flags;
+	char cpu_max[32];
+	char memory_max[32];
+	char pids_max[32];
+};
+
+struct console_plan {
+	int mode;
+	char socket_path[SUN_PATH_MAX];
+};
+
+struct idmap {
+	unsigned container_id;
+	unsigned host_id;
+	unsigned size;
+};
+
+enum ctr_state { ST_CREATING, ST_CREATED, ST_RUNNING, ST_STOPPED, ST_GONE };
+enum ctr_event { EV_CREATE_DONE, EV_START, EV_KILL, EV_PROC_EXIT, EV_DELETE };
+
+/* --- oci.c : your lesson 1/2/4 solutions --- */
+int json_str(const char *doc, const char *key, char *out, size_t cap);
+int json_bool(const char *doc, const char *key, int *out);
+int nsflags(const char *const names[], size_t n, unsigned long *out);
+int secure_join(const char *root, const char *path, char *out, size_t cap);
+int plan_container(const char *bundle, const char *doc, struct plan *p);
+const char *after_key(const char *doc, const char *key);
+
+/* --- cgroup.c : your lesson 6 solutions + the writes --- */
+int cg_cpu_max(long long quota, long long period, char *out, size_t cap);
+int cg_memory_max(long long limit, char *out, size_t cap);
+int cg_pids_max(long long limit, char *out, size_t cap);
+int cgroup_apply(const char *cg, const struct plan *p, int pid);
+int cgroup_remove(const char *cg);
+
+/* --- idmap.c : your lesson 5 solution --- */
+long long idmap_to_host(const struct idmap *maps, size_t n, unsigned id);
+long long idmap_to_container(const struct idmap *maps, size_t n, unsigned id);
+
+/* --- nspid.c : your lesson 3 solution --- */
+int nspid_parse(const char *line, int *out, size_t cap);
+int nspid_of(int pid, int *out, size_t cap);
+
+/* --- state.c : your lesson 7 solution + state.json --- */
+int lifecycle_next(int state, int event);
+int state_save(const char *dir, int st, int pid, const char *bundle);
+int state_load(const char *dir, int *st, int *pid, char *bundle, size_t cap);
+const char *state_name(int st);
+
+/* --- console.c : your lesson 8 solution + the PTY handoff --- */
+int console_plan(const char *doc, const char *socket_path,
+                 struct console_plan *p);
+int pty_open(char *slave_name, size_t cap);
+int console_connect(const char *sock_path);
+int console_send(int sock_fd, int master_fd);
+
+/* --- container.c --- */
+int container_create(const char *id, const char *bundle,
+                     const char *console_sock);
+int container_start(const char *id);
+int container_kill(const char *id, int sig);
+int container_delete(const char *id);
+int container_state(const char *id);
+
+char *read_file(const char *path);
+const char *run_dir(const char *id);
+
+#endif
+```
+
+## The heart: container.c
+
+This is the file the whole course has been building toward. The first
+half runs *inside* the new namespaces and is, line for line, the
+choreography from lessons 3 through 8:
+
+```c
+#define _GNU_SOURCE
+#include "minict.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static char child_stack[512 * 1024];
+
+struct child_args {
+	const struct plan *plan;
+	const struct console_plan *con;
+	int con_fd;    /* connected console socket, opened pre-pivot     */
+	int mapped[2]; /* parent -> child: "your id maps are written"    */
+	int start_fd;  /* the exec fifo, opened before the pivot     */
+	char **argv;
+};
+
+static void fail(const char *what) {
+	fprintf(stderr, "minict: %s: %s\n", what, strerror(errno));
+	_exit(1);
+}
+
+/* Everything below already runs inside the new namespaces. */
+static int child_main(void *arg) {
+	struct child_args *a = arg;
+	char b;
+
+	close(a->mapped[1]);
+	if (read(a->mapped[0], &b, 1) != 1)
+		fail("waiting for id maps");
+	close(a->mapped[0]);
+
+	if (a->plan->hostname[0] != '\0' &&
+	    sethostname(a->plan->hostname, strlen(a->plan->hostname)) != 0)
+		fail("sethostname");
+
+	/* The console socket path is a HOST path — reach it while we still
+	   can. The connected fd outlives the pivot; the path would not. */
+	if (a->con->mode == CONSOLE_PTY) {
+		a->con_fd = console_connect(a->con->socket_path);
+		if (a->con_fd < 0)
+			fail("connect to console socket");
+	}
+
+	/* --- lesson 4: the pivot_root dance --- */
+	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+		fail("make mounts private");
+	if (mount(a->plan->rootfs, a->plan->rootfs, NULL, MS_BIND, NULL) != 0)
+		fail("bind rootfs onto itself");
+	if (chdir(a->plan->rootfs) != 0)
+		fail("chdir rootfs");
+	if (syscall(SYS_pivot_root, ".", ".") != 0)
+		fail("pivot_root");
+	/* /proc must be mounted while the old root is still stacked: inside a
+	   user namespace the kernel grants a fresh procfs only when a
+	   fully-visible one already exists in this mount namespace. */
+	if (mount("proc", "proc", "proc", 0, NULL) != 0)
+		fail("mount /proc");
+	if (umount2(".", MNT_DETACH) != 0)
+		fail("detach old root");
+	if (chdir("/") != 0)
+		fail("chdir /");
+
+	/* --- lesson 8: allocate the terminal HERE, inside the box --- */
+	if (a->con->mode == CONSOLE_PTY) {
+		/* The container needs its own devpts instance: the slave node
+		   must live in this mount namespace for the path to mean
+		   anything, and its ownership follows our id mappings. */
+		if (mount("devpts", "/dev/pts", "devpts", 0,
+		          "newinstance,ptmxmode=0666") != 0)
+			fail("mount devpts");
+		/* posix_openpt opens /dev/ptmx, but a fresh devpts instance
+		   puts its multiplexor at /dev/pts/ptmx. Every real container
+		   image carries this symlink for exactly this reason. */
+		unlink("/dev/ptmx");
+		if (symlink("pts/ptmx", "/dev/ptmx") != 0)
+			fail("symlink /dev/ptmx");
+
+		char slave_name[64];
+		int master = pty_open(slave_name, sizeof slave_name);
+		if (master < 0)
+			fail("allocate pty");
+		/* The master leaves through the console socket; whoever holds
+		   the far end now holds this container's keyboard and screen. */
+		if (console_send(a->con_fd, master) != 0)
+			fail("send pty master");
+		close(master);
+		close(a->con_fd);
+
+		if (setsid() < 0)
+			fail("setsid");
+		int slave = open(slave_name, O_RDWR);
+		if (slave < 0)
+			fail("open pty slave");
+		if (ioctl(slave, TIOCSCTTY, 0) != 0)
+			fail("TIOCSCTTY");
+		dup2(slave, 0);
+		dup2(slave, 1);
+		dup2(slave, 2);
+		if (slave > 2)
+			close(slave);
+	}
+
+	/* --- lesson 7: park here. created, but not yet running. --- */
+	if (read(a->start_fd, &b, 1) != 1)
+		_exit(0); /* killed before start ever came */
+	close(a->start_fd);
+
+	execv(a->argv[0], a->argv);
+	fail("execv");
+	return 1;
+}
+```
+
+Read that against the lessons and there are no surprises left in it:
+the id-map handshake (lesson 5), the six-step pivot (lesson 4), the
+devpts-and-SCM_RIGHTS handoff (lesson 8), the park (lesson 7). The one
+line no lesson predicted is the `/proc` mount landing *before* the old
+root is detached — inside a user namespace the kernel grants a fresh
+procfs only when a fully-visible one is still present in the mount
+namespace, so the order is forced.
+
+The second half is the parent: it plans, clones, writes the maps the
+child is waiting on, applies the cgroup, and implements the four
+lifecycle operations on top of your state machine.
+
+```c
+static int write_file(const char *path, const char *text) {
+	int fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	ssize_t n = write(fd, text, strlen(text));
+	close(fd);
+	return n < 0 ? -1 : 0;
+}
+
+/* The rootless map: exactly one id — ours — becomes container root. */
+static int write_id_maps(int pid) {
+	char path[64], line[64];
+	struct idmap uid = {0, getuid(), 1};
+	struct idmap gid = {0, getgid(), 1};
+
+	snprintf(path, sizeof path, "/proc/%d/setgroups", pid);
+	if (write_file(path, "deny") != 0)
+		return -1;
+	snprintf(path, sizeof path, "/proc/%d/uid_map", pid);
+	snprintf(line, sizeof line, "%u %u %u", uid.container_id, uid.host_id,
+	         uid.size);
+	if (write_file(path, line) != 0)
+		return -1;
+	snprintf(path, sizeof path, "/proc/%d/gid_map", pid);
+	snprintf(line, sizeof line, "%u %u %u", gid.container_id, gid.host_id,
+	         gid.size);
+	return write_file(path, line);
+}
+
+/* process.args[0]: scan to the array, take the first quoted string. */
+static int first_arg(const char *doc, char *out, size_t cap) {
+	const char *proc = after_key(doc, "process");
+	if (proc == NULL)
+		return -1;
+	const char *args = after_key(proc, "args");
+	if (args == NULL)
+		return -1;
+	const char *q = strchr(args, '"');
+	if (q == NULL)
+		return -1;
+	size_t i = 0;
+	for (q++; *q && *q != '"'; q++) {
+		if (i + 1 >= cap)
+			return -1;
+		out[i++] = *q;
+	}
+	out[i] = '\0';
+	return *q == '"' ? 0 : -1;
+}
+
+static void cgroup_path(const char *id, char *out, size_t cap) {
+	const char *base = getenv("MINICT_CGROUP");
+	snprintf(out, cap, "%s/ctr-%s", base ? base : "/sys/fs/cgroup", id);
+}
+
+int container_create(const char *id, const char *bundle,
+                     const char *console_sock) {
+	char cfg_path[512];
+	snprintf(cfg_path, sizeof cfg_path, "%s/config.json", bundle);
+	char *doc = read_file(cfg_path);
+	if (doc == NULL) {
+		fprintf(stderr, "minict: cannot read %s\n", cfg_path);
+		return 1;
+	}
+
+	/* ---- the final challenge: decide everything, touch nothing ---- */
+	struct plan plan;
+	if (plan_container(bundle, doc, &plan) != 0) {
+		fprintf(stderr, "minict: invalid config.json\n");
+		return 1;
+	}
+	const char *proc = after_key(doc, "process");
+	struct console_plan con;
+	if (console_plan(proc ? proc : doc, console_sock, &con) != 0) {
+		fprintf(stderr, "minict: terminal/console-socket mismatch\n");
+		return 1;
+	}
+	char cmd[256];
+	if (first_arg(doc, cmd, sizeof cmd) != 0) {
+		fprintf(stderr, "minict: config has no process.args\n");
+		return 1;
+	}
+	char *argv[] = {cmd, NULL};
+
+	const char *dir = run_dir(id);
+	if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+		perror("minict: state dir");
+		return 1;
+	}
+
+	struct child_args a = {.plan = &plan, .con = &con, .argv = argv};
+
+	/* The exec fifo — runc's trick. Init blocks reading it; `start`
+	   unblocks it by opening the write end. Opening O_RDWR never
+	   blocks and never hits ENXIO, and the child inherits the fd, so
+	   the fifo keeps a reader even after this process exits. */
+	char fifo[512];
+	snprintf(fifo, sizeof fifo, "%s/exec.fifo", dir);
+	unlink(fifo);
+	if (mkfifo(fifo, 0600) != 0) {
+		perror("minict: mkfifo");
+		return 1;
+	}
+	a.start_fd = open(fifo, O_RDWR);
+	if (a.start_fd < 0 || pipe(a.mapped) != 0)
+		return 1;
+
+	pid_t pid = clone(child_main, child_stack + sizeof child_stack,
+	                  plan.clone_flags | SIGCHLD, &a);
+	if (pid < 0) {
+		perror("minict: clone");
+		return 1;
+	}
+
+	if (write_id_maps(pid) != 0) {
+		fprintf(stderr, "minict: cannot write id maps\n");
+		kill(pid, SIGKILL);
+		return 1;
+	}
+
+	char cg[512];
+	cgroup_path(id, cg, sizeof cg);
+	if (cgroup_apply(cg, &plan, pid) != 0)
+		fprintf(stderr,
+		        "minict: note: cgroup limits not applied (%s) — see the "
+		        "delegation note in the epilogue\n",
+		        strerror(errno));
+
+	close(a.mapped[0]);
+	if (write(a.mapped[1], "x", 1) != 1)
+		return 1;
+	close(a.mapped[1]);
+
+	int nspids[8];
+	int levels = nspid_of(pid, nspids, 8);
+	printf("minict: created %s — host pid %d", id, pid);
+	if (levels >= 2)
+		printf(", pid %d inside", nspids[levels - 1]);
+	printf("\n");
+
+	state_save(dir, lifecycle_next(ST_CREATING, EV_CREATE_DONE), pid, bundle);
+	free(doc);
+	return 0;
+}
+
+int container_start(const char *id) {
+	const char *dir = run_dir(id);
+	int st, pid;
+	char bundle[256];
+	if (state_load(dir, &st, &pid, bundle, sizeof bundle) != 0) {
+		fprintf(stderr, "minict: no such container: %s\n", id);
+		return 1;
+	}
+	int next = lifecycle_next(st, EV_START);
+	if (next < 0) {
+		fprintf(stderr, "minict: cannot start a %s container\n",
+		        state_name(st));
+		return 1;
+	}
+
+	char fifo[512];
+	snprintf(fifo, sizeof fifo, "%s/exec.fifo", dir);
+	int fd = open(fifo, O_WRONLY);
+	if (fd < 0 || write(fd, "x", 1) != 1) {
+		fprintf(stderr, "minict: cannot wake init: %s\n", strerror(errno));
+		return 1;
+	}
+	close(fd);
+	state_save(dir, next, pid, bundle);
+
+	/* We are not init's parent (create was), so we cannot waitpid it.
+	   Poll /proc until the pid is gone, then record the exit. */
+	char proc[64];
+	snprintf(proc, sizeof proc, "/proc/%d", pid);
+	while (access(proc, F_OK) == 0)
+		usleep(50000);
+	state_save(dir, lifecycle_next(next, EV_PROC_EXIT), pid, bundle);
+	return 0;
+}
+
+int container_kill(const char *id, int sig) {
+	const char *dir = run_dir(id);
+	int st, pid;
+	char bundle[256];
+	if (state_load(dir, &st, &pid, bundle, sizeof bundle) != 0) {
+		fprintf(stderr, "minict: no such container: %s\n", id);
+		return 1;
+	}
+	if (lifecycle_next(st, EV_KILL) < 0) {
+		fprintf(stderr, "minict: cannot kill a %s container\n",
+		        state_name(st));
+		return 1;
+	}
+	if (kill(pid, sig) != 0) {
+		perror("minict: kill");
+		return 1;
+	}
+	/* The signal is sent; the state moves only when the process dies. */
+	char proc[64];
+	snprintf(proc, sizeof proc, "/proc/%d", pid);
+	for (int i = 0; i < 40 && access(proc, F_OK) == 0; i++)
+		usleep(50000);
+	if (access(proc, F_OK) != 0)
+		state_save(dir, lifecycle_next(st, EV_PROC_EXIT), pid, bundle);
+	return 0;
+}
+
+int container_delete(const char *id) {
+	const char *dir = run_dir(id);
+	int st, pid;
+	char bundle[256];
+	if (state_load(dir, &st, &pid, bundle, sizeof bundle) != 0) {
+		fprintf(stderr, "minict: no such container: %s\n", id);
+		return 1;
+	}
+	if (lifecycle_next(st, EV_DELETE) < 0) {
+		fprintf(stderr, "minict: cannot delete a %s container\n",
+		        state_name(st));
+		return 1;
+	}
+	char path[512], cg[512];
+	cgroup_path(id, cg, sizeof cg);
+	cgroup_remove(cg);
+	snprintf(path, sizeof path, "%s/state.json", dir);
+	unlink(path);
+	snprintf(path, sizeof path, "%s/exec.fifo", dir);
+	unlink(path);
+	rmdir(dir);
+	printf("minict: deleted %s\n", id);
+	return 0;
+}
+
+int container_state(const char *id) {
+	const char *dir = run_dir(id);
+	char path[512];
+	snprintf(path, sizeof path, "%s/state.json", dir);
+	char *doc = read_file(path);
+	if (doc == NULL) {
+		fprintf(stderr, "minict: no such container: %s\n", id);
+		return 1;
+	}
+	fputs(doc, stdout);
+	free(doc);
+	return 0;
+}
+```
+
+Two things there are worth pausing on. `write_id_maps` uses your
+`struct idmap` to build the literal `0 1000 1` line you read in
+milestone 4 — the type from the challenge is the type the kernel wants.
+And `container_start` polls `/proc/<pid>` instead of calling `waitpid`:
+`start` is a *different process* from `create`, so it is not init's
+parent and has no child to wait on. That is the price of the
+create/start split, and every runtime pays some version of it.
+
+## The CLI
+
+`src/main.c` — argument dispatch, plus the two helpers the other files
+use for reading a file and locating a container's state directory:
+
+```c
+#define _GNU_SOURCE
+#include "minict.h"
+
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* Slurp a whole file into a NUL-terminated buffer the caller frees. */
+char *read_file(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (f == NULL)
+		return NULL;
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return NULL;
+	}
+	long n = ftell(f);
+	rewind(f);
+	if (n < 0) {
+		fclose(f);
+		return NULL;
+	}
+	char *buf = malloc((size_t)n + 1);
+	if (buf == NULL) {
+		fclose(f);
+		return NULL;
+	}
+	size_t got = fread(buf, 1, (size_t)n, f);
+	fclose(f);
+	buf[got] = '\0';
+	return buf;
+}
+
+/* Where a container's state.json and exec.fifo live. Rootless, so
+   under $XDG_RUNTIME_DIR rather than /run/minict. */
+const char *run_dir(const char *id) {
+	static char dir[768];
+	const char *base = getenv("XDG_RUNTIME_DIR");
+	if (base == NULL)
+		base = "/tmp";
+	char parent[512];
+	snprintf(parent, sizeof parent, "%s/minict", base);
+	mkdir(parent, 0700);
+	snprintf(dir, sizeof dir, "%s/%s", parent, id);
+	return dir;
+}
+
+static int usage(void) {
+	fputs("usage:\n"
+	      "  minict create <id> <bundle> [--console-socket PATH]\n"
+	      "  minict start  <id>\n"
+	      "  minict state  <id>\n"
+	      "  minict kill   <id> [SIGNAL]\n"
+	      "  minict delete <id>\n",
+	      stderr);
+	return 2;
+}
+
+int main(int argc, char **argv) {
+	if (argc < 3)
+		return usage();
+	const char *cmd = argv[1], *id = argv[2];
+
+	if (strcmp(cmd, "create") == 0) {
+		if (argc < 4)
+			return usage();
+		const char *sock = NULL;
+		for (int i = 4; i + 1 < argc; i++)
+			if (strcmp(argv[i], "--console-socket") == 0)
+				sock = argv[i + 1];
+		return container_create(id, argv[3], sock);
+	}
+	if (strcmp(cmd, "start") == 0)
+		return container_start(id);
+	if (strcmp(cmd, "state") == 0)
+		return container_state(id);
+	if (strcmp(cmd, "delete") == 0)
+		return container_delete(id);
+	if (strcmp(cmd, "kill") == 0) {
+		int sig = SIGTERM;
+		if (argc > 3) {
+			if (strcmp(argv[3], "KILL") == 0 || strcmp(argv[3], "9") == 0)
+				sig = SIGKILL;
+			else if (strcmp(argv[3], "INT") == 0)
+				sig = SIGINT;
+		}
+		return container_kill(id, sig);
+	}
+	return usage();
+}
+```
+
+Note where the state lives: `$XDG_RUNTIME_DIR/minict/<id>`, not
+`/run/minict`. Rootless runtimes keep their bookkeeping somewhere the
+user can actually write, and podman does exactly this.
+
+## The four companions
+
+Each goes at the bottom of the file that already holds your solution.
+
+**`src/cgroup.c`** — the writes your formatters feed:
+
+```c
+/* ---- new: the four file operations that use them ---- */
+
+static int write_str(const char *dir, const char *file, const char *val) {
+	char path[512];
+	if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, file) >= sizeof path)
+		return -1;
+	FILE *f = fopen(path, "w");
+	if (f == NULL)
+		return -1;
+	int ok = fputs(val, f) >= 0;
+	if (fclose(f) != 0)
+		ok = 0;
+	return ok ? 0 : -1;
+}
+
+/* mkdir the leaf, write the three limits, move pid into it. Writing a
+   "max" that was already max is harmless, so there is no special case. */
+int cgroup_apply(const char *cg, const struct plan *p, int pid) {
+	if (mkdir(cg, 0755) != 0 && access(cg, F_OK) != 0)
+		return -1;
+	if (write_str(cg, "cpu.max", p->cpu_max) != 0)
+		return -1;
+	if (write_str(cg, "memory.max", p->memory_max) != 0)
+		return -1;
+	if (write_str(cg, "pids.max", p->pids_max) != 0)
+		return -1;
+	char buf[32];
+	snprintf(buf, sizeof buf, "%d", pid);
+	return write_str(cg, "cgroup.procs", buf);
+}
+
+int cgroup_remove(const char *cg) {
+	return rmdir(cg);
+}
+```
+
+**`src/nspid.c`** — hand your parser the real file:
+
+```c
+/* ---- new: feed it the real file ---- */
+
+int nspid_of(int pid, int *out, size_t cap) {
+	char path[64], line[256];
+	snprintf(path, sizeof path, "/proc/%d/status", pid);
+	FILE *f = fopen(path, "r");
+	if (f == NULL)
+		return -1;
+	int n = -1;
+	while (fgets(line, sizeof line, f) != NULL) {
+		if (strncmp(line, "NSpid:", 6) == 0) {
+			n = nspid_parse(line, out, cap);
+			break;
+		}
+	}
+	fclose(f);
+	return n;
+}
+```
+
+**`src/state.c`** — the `state.json` the spec asks a runtime to keep.
+It is read back with *your own* JSON scanner, which is a quietly
+satisfying moment: the parser you wrote in lesson 2 is now parsing this
+runtime's own output.
+
+```c
+/* ---- new: the state.json the OCI spec asks a runtime to keep ---- */
+
+static const char *const names[] = {"creating", "created", "running",
+                                    "stopped", "deleted"};
+
+const char *state_name(int st) {
+	if (st < 0 || st > ST_GONE)
+		return "unknown";
+	return names[st];
+}
+
+int state_save(const char *dir, int st, int pid, const char *bundle) {
+	char path[512];
+	snprintf(path, sizeof path, "%s/state.json", dir);
+	FILE *f = fopen(path, "w");
+	if (f == NULL)
+		return -1;
+	fprintf(f,
+	        "{\n  \"ociVersion\": \"1.2.0\",\n"
+	        "  \"status\": \"%s\",\n"
+	        "  \"pid\": %d,\n"
+	        "  \"bundle\": \"%s\"\n}\n",
+	        state_name(st), pid, bundle);
+	return fclose(f) == 0 ? 0 : -1;
+}
+
+int state_load(const char *dir, int *st, int *pid, char *bundle, size_t cap) {
+	char path[512];
+	snprintf(path, sizeof path, "%s/state.json", dir);
+	char *doc = read_file(path);
+	if (doc == NULL)
+		return -1;
+
+	char status[32];
+	int rc = -1;
+	if (json_str(doc, "status", status, sizeof status) == 0 &&
+	    json_str(doc, "bundle", bundle, cap) == 0) {
+		*st = -1;
+		for (int i = 0; i <= ST_GONE; i++)
+			if (strcmp(status, names[i]) == 0)
+				*st = i;
+		const char *p = after_key(doc, "pid");
+		if (*st >= 0 && p != NULL && sscanf(p, " %d", pid) == 1)
+			rc = 0;
+	}
+	free(doc);
+	return rc;
+}
+```
+
+**`src/console.c`** — the PTY and the fd handoff:
+
+```c
+/* ---- new: the syscalls the plan authorizes ---- */
+
+/* Allocate a PTY pair from the CONTAINER's own devpts instance and
+   write back the slave's path. Called after the pivot, so /dev/pts/N
+   names a node inside the container and its ownership follows the id
+   mappings. */
+int pty_open(char *slave_name, size_t cap) {
+	int m = posix_openpt(O_RDWR | O_NOCTTY);
+	if (m < 0)
+		return -1;
+	if (grantpt(m) != 0 || unlockpt(m) != 0) {
+		close(m);
+		return -1;
+	}
+	if (ptsname_r(m, slave_name, cap) != 0) {
+		close(m);
+		return -1;
+	}
+	return m;
+}
+
+/* Connect to the caller's console socket. This must happen BEFORE
+   pivot_root: the path is a host path, and after the pivot the
+   container cannot name it. The connected fd survives the pivot —
+   an open file description does not care what / points at. */
+int console_connect(const char *sock_path) {
+	int s = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (s < 0)
+		return -1;
+	struct sockaddr_un addr = {.sun_family = AF_UNIX};
+	if (strlen(sock_path) + 1 > sizeof addr.sun_path) {
+		close(s);
+		return -1;
+	}
+	strcpy(addr.sun_path, sock_path);
+	if (connect(s, (struct sockaddr *)&addr, sizeof addr) != 0) {
+		close(s);
+		return -1;
+	}
+	return s;
+}
+
+/* Send the master fd down an already-connected console socket as
+   SCM_RIGHTS. The byte in iov is not payload — a control message needs
+   at least one byte of ordinary data to ride along with. */
+int console_send(int s, int master_fd) {
+	char byte = 'C';
+	struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u = {0};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = u.buf,
+		.msg_controllen = sizeof u.buf,
+	};
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SCM_RIGHTS;
+	cm->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &master_fd, sizeof(int));
+
+	return sendmsg(s, &msg, 0) == 1 ? 0 : -1;
+}
+```
+
+`console_send` is worth reading twice. The `SCM_RIGHTS` control message
+is the payload; the single byte in `iov` exists only because a control
+message needs at least one byte of ordinary data to travel with. What
+arrives on the other side is not the number 5 — it is a new entry in
+the receiver's fd table pointing at the same open file.
+
+## The other side of the socket
+
+`src/attach.c` is a separate program: the caller, standing in for
+containerd or `docker attach`. It listens, receives the master fd, puts
+your terminal in raw mode (so the container's line discipline is the
+only one interpreting keys), and pumps bytes both ways until the far
+end closes.
+
+```c
+/* minict-attach — the CALLER's side of the console socket.
+   Listens on a unix socket, receives the PTY master fd that `minict
+   create` sends, then relays your terminal to it until the container
+   exits. This is, in miniature, what `docker attach` does. */
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <termios.h>
+#include <unistd.h>
+
+static struct termios saved;
+static int raw_active;
+
+static void restore(void) {
+	if (raw_active)
+		tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+}
+
+/* Put OUR terminal in raw mode: the container's line discipline is the
+   one that should echo and interpret Ctrl-C, not ours. */
+static void go_raw(void) {
+	if (tcgetattr(STDIN_FILENO, &saved) != 0)
+		return;
+	struct termios raw = saved;
+	cfmakeraw(&raw);
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+		raw_active = 1;
+		atexit(restore);
+	}
+}
+
+static int recv_fd(int conn) {
+	char byte;
+	struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u = {0};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = u.buf,
+		.msg_controllen = sizeof u.buf,
+	};
+	if (recvmsg(conn, &msg, 0) < 1)
+		return -1;
+	for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+		if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+			int fd;
+			memcpy(&fd, CMSG_DATA(c), sizeof fd);
+			return fd;
+		}
+	}
+	return -1;
+}
+
+int main(int argc, char **argv) {
+	if (argc != 2) {
+		fprintf(stderr, "usage: minict-attach <console.sock>\n");
+		return 2;
+	}
+	const char *path = argv[1];
+	unlink(path);
+
+	int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un addr = {.sun_family = AF_UNIX};
+	if (strlen(path) + 1 > sizeof addr.sun_path) {
+		fprintf(stderr, "minict-attach: socket path too long\n");
+		return 1;
+	}
+	strcpy(addr.sun_path, path);
+	if (bind(srv, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+	    listen(srv, 1) != 0) {
+		perror("minict-attach: listen");
+		return 1;
+	}
+	fprintf(stderr, "minict-attach: waiting on %s\n", path);
+
+	int conn = accept(srv, NULL, NULL);
+	if (conn < 0) {
+		perror("minict-attach: accept");
+		return 1;
+	}
+	int master = recv_fd(conn);
+	close(conn);
+	close(srv);
+	unlink(path);
+	if (master < 0) {
+		fprintf(stderr, "minict-attach: no fd in that message\n");
+		return 1;
+	}
+	fprintf(stderr, "minict-attach: got the pty master (fd %d)\n", master);
+
+	go_raw();
+	struct pollfd fds[2] = {
+		{.fd = STDIN_FILENO, .events = POLLIN},
+		{.fd = master, .events = POLLIN},
+	};
+	for (;;) {
+		if (poll(fds, 2, -1) < 0 && errno != EINTR)
+			break;
+		char buf[4096];
+		if (fds[0].revents & POLLIN) {
+			ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+			if (n <= 0 || write(master, buf, (size_t)n) != n)
+				break;
+		}
+		if (fds[1].revents & POLLIN) {
+			ssize_t n = read(master, buf, sizeof buf);
+			if (n <= 0)
+				break; /* container closed the far end */
+			if (write(STDOUT_FILENO, buf, (size_t)n) != n)
+				break;
+		}
+		if (fds[1].revents & (POLLHUP | POLLERR))
+			break;
+	}
+	restore();
+	fprintf(stderr, "\r\nminict-attach: console closed\n");
+	return 0;
+}
+```
+
+## Building it
+
+```make
+CFLAGS = -std=gnu11 -Wall -Wextra -O1 -g
+OBJS = src/oci.o src/cgroup.o src/idmap.o src/nspid.o src/state.o \
+       src/console.o src/container.o src/main.o
+
+all: minict minict-attach
+
+minict: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS)
+
+minict-attach: src/attach.o
+	$(CC) $(CFLAGS) -o $@ src/attach.o
+
+$(OBJS) src/attach.o: src/minict.h
+
+clean:
+	rm -f minict minict-attach src/*.o
+```
+
+```
+$ make
+$ ls
+Makefile  bundle  minict  minict-attach  src
+```
+
+## The whole thing, running
+
+Batch mode first — no terminal, just a command and its output:
+
+```
+$ minict create demo ./bundle
+minict: created demo — host pid 40219, pid 1 inside
+$ minict state demo | grep status
+  "status": "created",
+$ minict start demo
+duck
+$ minict delete demo
+minict: deleted demo
+```
+
+(That `duck` is `/bin/hostname` running inside, printing the hostname
+your `config.json` asked for and your `sethostname` applied.)
+
+Now interactive. Terminal one:
+
+```
+$ minict-attach /tmp/console.sock
+minict-attach: waiting on /tmp/console.sock
+```
+
+Terminal two — set `"terminal": true` in `bundle/config.json` and
+`"args": ["/bin/sh"]`:
+
+```
+$ minict create demo ./bundle --console-socket /tmp/console.sock
+minict: created demo — host pid 41533, pid 1 inside
+$ minict start demo
+```
+
+Terminal one comes alive:
+
+```
+minict-attach: got the pty master (fd 5)
+/ # hostname
+duck
+/ # id
+uid=0(root) gid=0(root) groups=65534(nobody),65534(nobody),65534(nobody),65534(nobody),0(root)
+/ # ps
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    4 root      0:00 ps
+/ # ls /
+bin    etc    lib    proc   sys    usr
+dev    home   lib64  root   tmp    var
+/ # tty
+/dev/pts/0
+/ # exit
+minict-attach: console closed
+```
+
+Six answers, six lessons. The hostname came from your UTS namespace.
+The uid came from your user namespace — and on the host that same
+process belongs to your ordinary account. Those repeated `nobody`
+entries are the overflow id doing its job: your supplementary groups
+have no mapping in this namespace, so the kernel reports each as 65534
+rather than leaking a host group number. `ps` shows two processes
+because `/proc` is a fresh procfs in a fresh pid namespace. `ls /` is
+the unpacked image, because the old root was pivoted away and
+unmounted. `/dev/pts/0` is a terminal in a devpts instance that exists
+nowhere else. And it all happened without `sudo`.
+
+With cgroups delegated, the limits are real too:
+
+```
+$ systemd-run --user --scope -p Delegate=yes bash
+$ export MINICT_CGROUP=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+$ mkdir "$MINICT_CGROUP/sup" && echo $$ > "$MINICT_CGROUP/sup/cgroup.procs"
+$ echo "+pids +memory +cpu" > "$MINICT_CGROUP/cgroup.subtree_control"
+$ minict create cg1 ./bundle
+minict: created cg1 — host pid 41746, pid 1 inside
+$ cat "$MINICT_CGROUP/ctr-cg1/pids.max"
+64
+$ cat "$MINICT_CGROUP/ctr-cg1/memory.max"
+268435456
+$ cat "$MINICT_CGROUP/ctr-cg1/cpu.max"
+50000 100000
+```
+
+Those three values travelled from `config.json`, through
+`plan_container`, through your three formatters, into kernel state.
+That is the entire thesis of this course in one command.
+
+## When it doesn't work
+
+- **`clone: Operation not permitted`** — unprivileged user namespaces
+  are off. Check `sysctl kernel.unprivileged_userns_clone` (Debian) or
+  `user.max_user_namespaces` (any distro); on Arch and Fedora they are
+  on by default. Confirm with `unshare -U -r id`.
+- **`mount /proc: Operation not permitted`** — you dropped `"user"`
+  from the namespace list but kept `"mount"`. Without a user namespace
+  an ordinary user may not mount anything; add it back.
+- **`cgroup limits not applied (Permission denied)`** — you are not in
+  a delegated scope. Harmless: every other part still works. Use the
+  `systemd-run` recipe above to get limits.
+- **`cgroup.subtree_control: Device or resource busy`** — the
+  no-internal-process rule, catching you exactly as advertised: some
+  process is still sitting in the cgroup you're trying to enable
+  controllers on. Usually it's a subshell your own command line spawned
+  a moment earlier. Move your shell into the `sup` leaf *first*, then
+  enable controllers; if it still complains, `cat cgroup.procs` in that
+  directory and see who's loitering.
+- **`execv: No such file or directory`** — the path in `process.args`
+  doesn't exist *inside the rootfs*, or the binary is dynamically
+  linked against libraries the image lacks. Busybox is static; that's
+  why this course uses it.
+- **The container starts itself before you call `start`** — the exec
+  fifo was opened with the wrong flags. It must be `O_RDWR` in
+  `create`; anything else either blocks or returns EOF immediately.
+- **`minict create ... | grep something` never returns.** Nothing is
+  broken, and the container was created fine. The parked init inherited
+  stdout, so the pipe has a writer that will not close until the
+  container exits — and `grep` waits for EOF. This is the same reason
+  `docker run -d` detaches its stdio rather than inheriting yours.
+  Redirect `create`'s output to a file, or don't pipe it.
+
+## What a real runtime does that yours doesn't
+
+Honest accounting, so you know the size of the remaining gap:
+
+- **Mounts.** The spec's `mounts` array (`/proc`, `/dev`, `/sys`,
+  tmpfs, volumes, bind mounts with options) — yours hardcodes `/proc`
+  and `devpts`. This is where `secure_join` would earn its keep for
+  real, on every destination.
+- **Capabilities, seccomp, LSMs, rlimits, `no_new_privs`.** The whole
+  second layer of confinement. runc's seccomp profile alone blocks
+  ~40 syscalls.
+- **Networking.** Yours shares your host's network namespace. A real
+  stack creates a netns and hands it to a CNI plugin for veth pairs,
+  bridges, and NAT.
+- **`exec` into a running container** (`setns` on each namespace),
+  `ps`, `events`, `checkpoint`, and the `paused` state via the freezer.
+- **Hooks** — `createRuntime`, `startContainer`, `poststop`, etc.
+- **A real JSON parser**, so key names may nest and repeat, and so a
+  hostile document can't confuse a positional scan.
+
+None of those change the shape of what you built. They are more of the
+same job: read the spec, decide before you act, and refuse anything you
+cannot honor. You have written that runtime's spine — the next commit
+is just more spec.
